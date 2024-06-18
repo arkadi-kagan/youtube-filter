@@ -32,20 +32,30 @@ protected:
     void replace_domain_name(std::string& buffer, const std::string& from, const std::string& to);
     void replace_all_server_to_target(std::vector<uint8_t>& buffer, const std::string& host_name);
     void replace_all_server_to_target(std::string& buffer, const std::string& host_name);
-    void replace_all_target_to_server(std::vector<uint8_t>& buffer, const std::string& host_name);
+    void replace_all_target_to_server_and_filter(
+        std::vector<uint8_t>& buffer,
+        const std::string& host_name,
+        const std::map<std::string, std::string>& request_header);
     void replace_all_target_to_server(std::string& buffer, const std::string& host_name);
 
     bool is_text(const std::string& content_type);
 
     int run_single_port(const std::string& host_name, const std::string& server_port);
 
-    std::string wget_text(const std::string& target);
+    virtual void filter(std::string& buffer, const std::map<std::string, std::string>& request_header);
 
 protected:
     std::map<std::string, std::string> m_server_port_to_target;
 
 public:
-    void init(const std::string& host_name, int first_port, const std::string& main_target, const std::vector<std::string>& other_targets);
+    void init(
+        const std::string& host_name,
+        int first_port,
+        const std::string& main_target,
+        const std::map<std::string, std::string>& other_targets,
+        const std::vector<std::string>& filenames);
 
     int run(const std::string& host_name);
+
+    std::string wget_text(const std::string& target, const std::string& path);
 };

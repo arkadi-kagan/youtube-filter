@@ -4,6 +4,7 @@
 
 #include "ProxyHTTPS.h"
 #include <string.h>
+#include <signal.h>
 #include <unistd.h>
 
 static const int SERVER_PORT = 5000;
@@ -24,9 +25,25 @@ static int print_help(const char* app_name)
     return 1;
 }
 
+static bool save_text(const std::string& buffer, const std::string& filename)
+{
+    FILE* f = fopen(filename.c_str(), "w");
+    if (f == nullptr)
+        return false;
+    fwrite(buffer.c_str(), 1, buffer.length(), f);
+    fclose(f);
+    return true;
+}
 
 int main(int cargs, const char** vargs)
 {
+    // Ignore SIGPIPE: https://github.com/Azure/azure-iot-sdk-c/issues/1423#issuecomment-668655861
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+
+
     char hostname[PATH_MAX];
     gethostname(hostname, sizeof(hostname));
     std::cout << "HTTPS proxy server from \"https://" << hostname << ":" << SERVER_PORT << "\" to \"https://" << TARGET_HOST << "\"\n";
@@ -40,11 +57,12 @@ int main(int cargs, const char** vargs)
     }
 
     ProxyHTTPS proxy;
-    proxy.init(hostname, SERVER_PORT, TARGET_HOST, std::vector<std::string>{
-        "accounts.google.com",
-        "accounts.youtube.com",
-        "youtube.com",
-        "play.google.com",
+    proxy.init(hostname, SERVER_PORT, TARGET_HOST, std::map<std::string, std::string>{
+        {"accounts.google.com", "/"},
+        {"accounts.youtube.com", "/"},
+    },{
+        "/base.js",
+        "/desktop_polymer.js",
     });
     return proxy.run(hostname);
 }
