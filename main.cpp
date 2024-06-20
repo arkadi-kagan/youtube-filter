@@ -60,6 +60,7 @@ int main(int cargs, const char** vargs)
     proxy.init(hostname, SERVER_PORT, TARGET_HOST, std::map<std::string, std::string>{
         {"accounts.google.com", "/"},
         {"accounts.youtube.com", "/"},
+        {"signaler-pa.googleapis.com", "/"},
     },{
         "/base.js",
         "/desktop_polymer.js",

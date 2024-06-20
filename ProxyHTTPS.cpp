@@ -520,6 +520,8 @@ std::string ProxyHTTPS::wget_text(const std::string& target, const std::string& 
                 {"Accept-Encoding", "identity"},
                 {"Cache-Control", "no-cache"},
                 {"Pragma", "no-cache"},
+                {"User-Agent", "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0"},
+                {"Connection", "keep-alive"},
             },
             {});
 
@@ -685,9 +687,10 @@ void ProxyHTTPS::filter(std::string& buffer, const std::map<std::string, std::st
     // This filter will be filled with debug code.
     // Real filter must be implemented in ProxyHTTPS heir.
     std::vector<std::string> tokens = {
-        "googlevideo.com",
+        // "googlevideo.com",
         // "jnn-pa.googleapis.com",
-        // "base.js"
+        // "base.js",
+        "desktop_polymer.js",
     };
     for (const auto& token : tokens)
     {
