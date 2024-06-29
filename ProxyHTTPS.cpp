@@ -1,6 +1,8 @@
 #include "ProxyHTTPS.h"
 #include <signal.h>
-#include <thread>
+#include <sys/socket.h>
+#include <zip.h>
+#include <zlib.h>
 
 
 static const std::string HTTPS_PORT = "443";
@@ -295,29 +297,14 @@ void ProxyHTTPS::verify_the_certificate(SSL* ssl)
     }
 }
 
-std::string ProxyHTTPS::regex_encode(const std::string& value)
+void ProxyHTTPS::set_timeout(BIO* bio)
 {
-    std::string result;
-    for (char c : value)
-    {
-        switch (c)
-        {
-            case '.':
-            case '$':
-            case '\\':
-            case '(':
-            case ')':
-            case ':':
-            case '[':
-            case ']':
-                result += std::string("\\") + c;
-                break;
-            default:
-                result += c;
-                break;
-        }
-    }
-    return result;
+    int fd = BIO_get_fd(bio, nullptr);
+    struct timeval tv;
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof tv);
 }
 
 void ProxyHTTPS::replace_domain_name(std::string& buffer, const std::string& from, const std::string& to)
@@ -326,8 +313,18 @@ void ProxyHTTPS::replace_domain_name(std::string& buffer, const std::string& fro
     while (true)
     {
         pos = buffer.find(from, pos);
-        while (pos != std::string::npos && pos > 0 && (buffer[pos - 1] == '.' || isalnum(buffer[pos - 1])))
+        while (pos != std::string::npos && pos > 0)
+        {
+            if (buffer[pos - 1] != '.' && !isalnum(buffer[pos - 1]))
+                break;
+            if (pos >= 3 && buffer.substr(pos - 3, 3) == "%2F") // encoded "/", as in "https://"
+                break;
+            if (pos >= 5 && buffer.substr(pos - 5, 5) == "%252F")
+                break;
+            if (pos >= 2 && buffer[pos - 1] == '.' && !isalnum(buffer[pos - 2]))
+                break;
             pos = buffer.find(from, pos + 1);
+        }
         if (pos == std::string::npos)
             break;
         buffer =
@@ -351,6 +348,7 @@ void ProxyHTTPS::replace_all_server_to_target(std::string& buffer, const std::st
     {
         replace_domain_name(buffer, host_name + ":" + pair.first, pair.second);
         replace_domain_name(buffer, host_name + "%3A" + pair.first, pair.second);
+        replace_domain_name(buffer, host_name + "%253A" + pair.first, pair.second);
     }
 }
 
@@ -360,6 +358,7 @@ void ProxyHTTPS::replace_all_target_to_server_and_filter(
     const std::map<std::string, std::string>& request_header)
 {
     std::string buffer_str((char*)buffer.data(), buffer.size());
+    adopt_all_domain_names(buffer_str);
     filter(buffer_str, request_header);
     replace_all_target_to_server(buffer_str, host_name);
     buffer.clear();
@@ -374,6 +373,66 @@ void ProxyHTTPS::replace_all_target_to_server(std::string& buffer, const std::st
     }
 }
 
+std::vector<uint8_t> ProxyHTTPS::unzip(const std::vector<uint8_t>& buffer)
+{
+    zip_error_t ziperr = {0};
+    zip_source_t* src = zip_source_buffer_create(buffer.data(), buffer.size(), 0, &ziperr);
+    if (src == nullptr)
+        return buffer;
+    std::vector<uint8_t> result;
+    zip_t* zip = zip_open_from_source(src, ZIP_RDONLY, &ziperr);
+    if (zip_get_num_entries(zip, ZIP_FL_NODIR) == 1)
+    {
+        zip_stat_t stat;
+        zip_stat_init(&stat);
+        zip_source_stat(src, &stat);
+        result.resize(stat.size);
+        zip_file_t* f = zip_fopen_index(zip, 0, ZIP_FL_NODIR);
+        zip_fread(f, result.data(), result.size());
+        zip_fclose(f);
+    }
+    else
+    {
+        result = buffer;
+    }
+    zip_close(zip);
+    return result;
+}
+
+std::vector<uint8_t> ProxyHTTPS::ungzip(const std::vector<uint8_t>& buffer)
+{
+    // http://zlib.net/zlib_how.html
+    constexpr const int CHUNK = 16384;
+    int ret;
+    z_stream strm;
+
+    // allocate inflate state
+    strm.zalloc = Z_NULL;
+    strm.zfree = Z_NULL;
+    strm.opaque = Z_NULL;
+    strm.avail_in = 0;
+    strm.next_in = Z_NULL;
+    ret = inflateInit(&strm);
+    if (ret != Z_OK)
+        return buffer;
+
+    // un-gzip in one chunk - do garbage otherwise
+    strm.avail_in = buffer.size();
+    strm.next_in = (uint8_t*)buffer.data();
+    std::vector<uint8_t> result(CHUNK);
+    strm.avail_out = result.size();
+    strm.next_out = result.data();
+    ret = inflate(&strm, Z_NO_FLUSH);
+    if (ret == Z_STREAM_END)
+        result.resize(strm.total_out);
+    else
+        result = buffer;
+
+    inflateEnd(&strm);
+
+    return result;
+}
+
 bool ProxyHTTPS::is_text(const std::string& content_type)
 {
     if (content_type.find("text/html") != std::string::npos)
@@ -383,96 +442,53 @@ bool ProxyHTTPS::is_text(const std::string& content_type)
     return false;
 }
 
+void ProxyHTTPS::adopt_all_domain_names(const std::string& buffer)
+{
+    std::set<std::string> ignore = {
+        "about",
+        "www.",
+    };
+    std::vector<std::string> https_tokens = {
+        "https://",
+        "https%3A%2F%2F",
+        "https%253A%252F%252F",
+        "href=\"//",
+    };
+
+    for (const auto& https : https_tokens)
+    {
+        size_t pos = 0;
+        while (pos != std::string::npos)
+        {
+            pos = buffer.find(https, pos);
+            if (pos == std::string::npos)
+                break;
+            pos += https.length();
+            size_t start = pos;
+            while (
+                    isalnum(buffer[pos]) ||
+                    strchr(".-\\", buffer[pos]) != nullptr
+                    )
+                pos++;
+            std::string target = buffer.substr(start, pos - start);
+            target.erase(std::remove(target.begin(), target.end(), '\\'), target.end());    // https://stackoverflow.com/a/20326454
+            if (target.empty())
+                continue;
+            if (ignore.count(target) > 0)
+                continue;
+            adopt_site(target);
+        }
+    }
+}
+
 void ProxyHTTPS::init(
     const std::string& host_name,
     int first_port,
-    const std::string& main_target,
-    const std::map<std::string, std::string>& other_targets,
-    const std::vector<std::string>& filenames)
+    const std::string& main_target)
 {
-    std::multimap<std::string, std::string> all_targets;
-    all_targets.insert({main_target, "/"});
-    for (const auto& pair: other_targets)
-        all_targets.insert({pair.first, pair.second});
-
-    std::multimap<std::string, std::string> file_targets;
-    
-    std::set<std::string> more_targets;
-    for (const auto& pair : all_targets)
-    {
-        std::string target = pair.first;
-        std::string body = wget_text(target, pair.second);
-        size_t pos = 0;
-        while (pos != std::string::npos)
-        {
-            pos = body.find("https://", pos);
-            if (pos == std::string::npos)
-                break;
-            pos += strlen("https://");
-            size_t start = pos;
-            while (
-                    isalnum(body[pos]) ||
-                    strchr(".-\\", body[pos]) != nullptr
-                    )
-                pos++;
-            std::string more_target = body.substr(start, pos - start);
-            more_target.erase(std::remove(more_target.begin(), more_target.end(), '\\'), more_target.end());    // https://stackoverflow.com/a/20326454
-            if (!more_target.empty() && all_targets.count(more_target) == 0)
-                more_targets.insert(more_target);
-        }
-        for (const auto& fn : filenames)
-        {   // Expect "base.js" to find something like "jsUrl":"/s/player/590f65a6/player_ias.vflset/en_US/base.js"
-            pos = body.find(fn + "\""); // "base.js\""
-            if (pos == std::string::npos)
-                continue;
-            size_t end = pos + fn.length();
-            while (pos > 0)
-            {
-                pos--;
-                if (body[pos] == '\"')
-                {
-                    size_t start = pos + 1;
-                    file_targets.insert({target, body.substr(start, end - start)});
-                    break;
-                }
-            }
-        }
-    }
-
-    for (const auto& pair : file_targets)
-    {
-        std::string target = pair.first;
-        std::string body = wget_text(target, pair.second);
-        size_t pos = 0;
-        while (pos != std::string::npos)
-        {
-            pos = body.find("https://", pos);
-            if (pos == std::string::npos)
-                break;
-            pos += strlen("https://");
-            size_t start = pos;
-            while (
-                    isalnum(body[pos]) ||
-                    strchr(".-\\", body[pos]) != nullptr
-                    )
-                pos++;
-            std::string more_target = body.substr(start, pos - start);
-            more_target.erase(std::remove(more_target.begin(), more_target.end(), '\\'), more_target.end());    // https://stackoverflow.com/a/20326454
-            if (!more_target.empty() && all_targets.count(more_target) == 0)
-                more_targets.insert(more_target);
-        }
-    }
-    int port = first_port;
-    m_server_port_to_target[std::to_string(port++)] = main_target;
-    for (const auto& pair : other_targets)
-        m_server_port_to_target[std::to_string(port++)] = pair.first;
-    for (const auto& target : more_targets)
-        m_server_port_to_target[std::to_string(port++)] = target;
-
-    std::cout << "To allow self-signed certificate, visit the follow sites:\n";
-    for (const auto& pair : m_server_port_to_target)
-        std::cout << "  https://" << host_name << ":" << pair.first << "    (" << pair.second << ")\n";
-    std::cout << std::endl;
+    m_host_name = host_name;
+    m_first_port = first_port;
+    adopt_site(main_target);
 }
 
 std::string ProxyHTTPS::wget_text(const std::string& target, const std::string& path)
@@ -592,6 +608,8 @@ int ProxyHTTPS::run_single_port(const std::string& host_name, const std::string&
         BIO_push(bio, bio_1);
         try
         {
+            set_timeout(bio);
+
             std::map<std::string, std::string> request_header;
             std::vector<uint8_t> request_body = receive_http_message(bio, request_header);
             if (request_header.count("---START---") == 0)
@@ -599,13 +617,17 @@ int ProxyHTTPS::run_single_port(const std::string& host_name, const std::string&
                 BIO_free_all(bio);
                 continue;
             }
-            request_header["Accept-Encoding"] = "identity";
+            if (is_text(request_header["Accept"]))
+                request_header["Accept-Encoding"] = "identity";
 
             for (auto& request_pair : request_header)
+            {
                 replace_all_server_to_target(request_pair.second, host_name);
+                adopt_all_domain_names(request_pair.second);
+            }
+            replace_all_server_to_target(request_body, host_name);
             
-            std::cout << "Request: " << request_header["---START---"] << std::endl;
-            replace_all_server_to_target(request_header["---START---"], host_name);
+            std::cout << "Request from " << server_port << ": " << request_header["---START---"] << std::endl;
 
             std::string connection_string = target + ":" + HTTPS_PORT;
             BIO*        client_bio        = BIO_new_connect(connection_string.c_str());
@@ -619,6 +641,8 @@ int ProxyHTTPS::run_single_port(const std::string& host_name, const std::string&
             }
             BIO* ssl_bio_client = BIO_new_ssl(ctx_client, 1);
             BIO_push(ssl_bio_client, client_bio);
+
+            set_timeout(ssl_bio_client);
 
             SSL_set_tlsext_host_name(get_ssl(ssl_bio_client), target.c_str());
             SSL_set1_host(get_ssl(ssl_bio_client), target.c_str());
@@ -634,23 +658,39 @@ int ProxyHTTPS::run_single_port(const std::string& host_name, const std::string&
             std::map<std::string, std::string> response_header;
             std::vector<uint8_t> response_body = receive_http_message(ssl_bio_client, response_header);
 
+            if (response_header.count("Content-Encoding") > 0 && response_header["Content-Encoding"] == "zip")
+            {
+                response_body = unzip(response_body);
+                response_header["Content-Encoding"] = "identity";
+            }
+
+            if (response_header.count("Content-Encoding") > 0 && response_header["Content-Encoding"] == "gzip")
+            {
+                response_body = ungzip(response_body);
+                response_header["Content-Encoding"] = "identity";
+            }
+
             if (is_text(response_header["Content-Type"]))
                 replace_all_target_to_server_and_filter(response_body, host_name, request_header);
 
             if (response_header.count("Content-Length") > 0)
                 response_header["Content-Length"] = std::to_string(response_body.size());
+            
+            response_header["Access-Control-Allow-Origin"] = "*";
 
             for (auto& response_pair : response_header)
+            {
+                adopt_all_domain_names(response_pair.second);
                 replace_all_target_to_server(response_pair.second, host_name);
+            }
 
-            std::cout << "Response: " << response_header["---START---"] << std::endl;
+            std::cout << "Response to " << server_port << ": " << response_header["---START---"] << std::endl;
 
             send_http_message(bio, response_header, response_body);
 
             BIO_pop(ssl_bio_client);
             BIO_free_all(ssl_bio_client);
             BIO_free_all(client_bio);
-
         }
         catch (const std::exception& ex)
         {
@@ -668,18 +708,35 @@ int ProxyHTTPS::run_single_port(const std::string& host_name, const std::string&
     return 0;
 }
 
-int ProxyHTTPS::run(const std::string& host_name)
+int ProxyHTTPS::run()
 {
-    std::vector<std::thread> threads;
-    for (const auto& pair : m_server_port_to_target)
-    {
-        threads.push_back(std::thread([this, &pair, &host_name](){
-            run_single_port(host_name, pair.first);
-        }));
-    }
-    for (auto& th : threads)
+    for (auto& th : m_threads)
         th.join();
     return 0;
+}
+
+void ProxyHTTPS::adopt_site(const std::string& target)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_target_to_server_port.count(target) > 0)
+        return;
+    std::set<int> skip_ports = {
+        5060, 5061,     // Default for Voice Over IP
+    };
+    int next_port = m_first_port;
+    if (!m_server_port_to_target.empty())
+        next_port = atoi(m_server_port_to_target.rbegin()->first.c_str()) + 1;
+    while (skip_ports.count(next_port) > 0)
+        next_port++;
+    std::string next_port_str = std::to_string(next_port);
+    m_target_to_server_port[target] = next_port_str;
+    m_server_port_to_target[next_port_str] = target;
+
+    std::cout << "Adopted " << target << " = " << m_host_name << ":" << next_port << std::endl;
+
+    m_threads.push_back(std::thread([this, next_port_str](){
+        run_single_port(m_host_name, next_port_str);
+    }));
 }
 
 void ProxyHTTPS::filter(std::string& buffer, const std::map<std::string, std::string>& request_header)
@@ -687,16 +744,18 @@ void ProxyHTTPS::filter(std::string& buffer, const std::map<std::string, std::st
     // This filter will be filled with debug code.
     // Real filter must be implemented in ProxyHTTPS heir.
     std::vector<std::string> tokens = {
-        // "googlevideo.com",
-        // "jnn-pa.googleapis.com",
-        // "base.js",
-        "desktop_polymer.js",
+        "action_handle_signin",
     };
     for (const auto& token : tokens)
     {
-        if (buffer.find(token) != std::string::npos)
+        auto pos = buffer.find(token);
+        if (pos != std::string::npos)
         {
             std::cout << "Found " << token << std::endl;
+            if (pos > 40)
+                std::cout << "\t" << buffer.substr(pos - 40, 70) << std::endl;
+            else
+                std::cout << "\t" << buffer.substr(0, 20) << std::endl;
             std::cout << "request_header:\n";
             for (const auto& pair : request_header)
             {

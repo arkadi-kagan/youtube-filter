@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 #include <regex>
+#include <thread>
+#include <mutex>
 
 #include <openssl/bio.h>
 #include <openssl/err.h>
@@ -27,8 +29,8 @@ protected:
     std::vector<uint8_t> receive_http_message(BIO* bio, std::map<std::string, std::string>& split_header);
     SSL* get_ssl(BIO* bio);
     void verify_the_certificate(SSL* ssl);
+    void set_timeout(BIO* bio);
 
-    std::string regex_encode(const std::string& value);
     void replace_domain_name(std::string& buffer, const std::string& from, const std::string& to);
     void replace_all_server_to_target(std::vector<uint8_t>& buffer, const std::string& host_name);
     void replace_all_server_to_target(std::string& buffer, const std::string& host_name);
@@ -37,6 +39,8 @@ protected:
         const std::string& host_name,
         const std::map<std::string, std::string>& request_header);
     void replace_all_target_to_server(std::string& buffer, const std::string& host_name);
+    std::vector<uint8_t> unzip(const std::vector<uint8_t>& buffer);
+    std::vector<uint8_t> ungzip(const std::vector<uint8_t>& buffer);
 
     bool is_text(const std::string& content_type);
 
@@ -44,18 +48,24 @@ protected:
 
     virtual void filter(std::string& buffer, const std::map<std::string, std::string>& request_header);
 
+    void adopt_site(const std::string& target);
+    void adopt_all_domain_names(const std::string& buffer);
+
 protected:
     std::map<std::string, std::string> m_server_port_to_target;
+    std::map<std::string, std::string> m_target_to_server_port;
+    int m_first_port;
+    std::string m_host_name;
+    std::vector<std::thread> m_threads;
+    std::mutex m_mutex;
 
 public:
     void init(
         const std::string& host_name,
         int first_port,
-        const std::string& main_target,
-        const std::map<std::string, std::string>& other_targets,
-        const std::vector<std::string>& filenames);
+        const std::string& main_target);
 
-    int run(const std::string& host_name);
+    int run();
 
     std::string wget_text(const std::string& target, const std::string& path);
 };
