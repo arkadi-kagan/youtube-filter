@@ -39,8 +39,9 @@ protected:
         const std::string& host_name,
         const std::map<std::string, std::string>& request_header);
     void replace_all_target_to_server(std::string& buffer, const std::string& host_name);
-    std::vector<uint8_t> unzip(const std::vector<uint8_t>& buffer);
-    std::vector<uint8_t> ungzip(const std::vector<uint8_t>& buffer);
+    void uncompress(std::vector<uint8_t>& buffer, std::map<std::string, std::string>& header);
+    std::vector<uint8_t> unzip(const std::vector<uint8_t>& buffer, bool& success);
+    std::vector<uint8_t> ungzip(const std::vector<uint8_t>& buffer, bool& success);
 
     bool is_text(const std::string& content_type);
 

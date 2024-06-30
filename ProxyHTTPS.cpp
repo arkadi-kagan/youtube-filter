@@ -373,8 +373,39 @@ void ProxyHTTPS::replace_all_target_to_server(std::string& buffer, const std::st
     }
 }
 
-std::vector<uint8_t> ProxyHTTPS::unzip(const std::vector<uint8_t>& buffer)
+void ProxyHTTPS::uncompress(std::vector<uint8_t>& buffer, std::map<std::string, std::string>& header)
 {
+    if (header.count("Content-Type") > 0 && !is_text(header["Content-Type"]))
+        return;
+    if (header.count("Content-Encoding") == 0)
+        return;
+    bool success;
+    if (header["Content-Encoding"] == "zip")
+    {
+        buffer = unzip(buffer, success);
+        if (success)
+            header["Content-Encoding"] = "identity";
+    }
+
+    if (header["Content-Encoding"] == "gzip")
+    {
+        //////////////////////////////////////
+        /// Debug
+        FILE* f = fopen("t.gz", "w");
+        fwrite(buffer.data(), 1, buffer.size(), f);
+        fclose(f);
+        //////////////////////////////////////
+
+
+        buffer = ungzip(buffer, success);
+        if (success)
+            header["Content-Encoding"] = "identity";
+    }
+}
+
+std::vector<uint8_t> ProxyHTTPS::unzip(const std::vector<uint8_t>& buffer, bool& success)
+{
+    success = false;
     zip_error_t ziperr = {0};
     zip_source_t* src = zip_source_buffer_create(buffer.data(), buffer.size(), 0, &ziperr);
     if (src == nullptr)
@@ -390,6 +421,7 @@ std::vector<uint8_t> ProxyHTTPS::unzip(const std::vector<uint8_t>& buffer)
         zip_file_t* f = zip_fopen_index(zip, 0, ZIP_FL_NODIR);
         zip_fread(f, result.data(), result.size());
         zip_fclose(f);
+        success = true;
     }
     else
     {
@@ -399,20 +431,22 @@ std::vector<uint8_t> ProxyHTTPS::unzip(const std::vector<uint8_t>& buffer)
     return result;
 }
 
-std::vector<uint8_t> ProxyHTTPS::ungzip(const std::vector<uint8_t>& buffer)
+std::vector<uint8_t> ProxyHTTPS::ungzip(const std::vector<uint8_t>& buffer, bool& success)
 {
     // http://zlib.net/zlib_how.html
-    constexpr const int CHUNK = 16384;
+    constexpr const int CHUNK = 0xFFFFFF;
     int ret;
-    z_stream strm;
+
+    success = false;
 
     // allocate inflate state
+    z_stream strm = {0};
     strm.zalloc = Z_NULL;
     strm.zfree = Z_NULL;
     strm.opaque = Z_NULL;
     strm.avail_in = 0;
     strm.next_in = Z_NULL;
-    ret = inflateInit(&strm);
+    ret = inflateInit2(&strm, MAX_WBITS + 16);
     if (ret != Z_OK)
         return buffer;
 
@@ -422,11 +456,16 @@ std::vector<uint8_t> ProxyHTTPS::ungzip(const std::vector<uint8_t>& buffer)
     std::vector<uint8_t> result(CHUNK);
     strm.avail_out = result.size();
     strm.next_out = result.data();
-    ret = inflate(&strm, Z_NO_FLUSH);
+    ret = inflate(&strm, Z_FINISH);
     if (ret == Z_STREAM_END)
+    {
         result.resize(strm.total_out);
+        success = true;
+    }
     else
+    {
         result = buffer;
+    }
 
     inflateEnd(&strm);
 
@@ -658,17 +697,7 @@ int ProxyHTTPS::run_single_port(const std::string& host_name, const std::string&
             std::map<std::string, std::string> response_header;
             std::vector<uint8_t> response_body = receive_http_message(ssl_bio_client, response_header);
 
-            if (response_header.count("Content-Encoding") > 0 && response_header["Content-Encoding"] == "zip")
-            {
-                response_body = unzip(response_body);
-                response_header["Content-Encoding"] = "identity";
-            }
-
-            if (response_header.count("Content-Encoding") > 0 && response_header["Content-Encoding"] == "gzip")
-            {
-                response_body = ungzip(response_body);
-                response_header["Content-Encoding"] = "identity";
-            }
+            uncompress(response_body, response_header);
 
             if (is_text(response_header["Content-Type"]))
                 replace_all_target_to_server_and_filter(response_body, host_name, request_header);
