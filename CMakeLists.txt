@@ -7,7 +7,8 @@ set(CMAKE_BUILD_TYPE Debug)
 
 find_package(OpenSSL)
 find_package(libzip)    # sudo apt install libzip-dev zipcmp zipmerge ziptool
-find_package(ZLIB)  # sudo apt install zlib1g-dev
+find_package(ZLIB)      # sudo apt install zlib1g-dev
+# sudo apt install libbrotli-dev
 
 add_executable(proxy
     ProxyHTTPS.h
@@ -21,4 +22,5 @@ target_link_libraries(proxy
         OpenSSL::Crypto
         zip
         ZLIB::ZLIB
+        brotlidec
 )

@@ -24,9 +24,9 @@ protected:
     BIO* accept_new_tcp_connection(BIO* accept_bio);
     std::vector<uint8_t> receive_some_data(BIO* bio);
     std::vector<std::string> split_headers(const std::string& text);
-    void send_http_message(BIO* bio, const std::map<std::string, std::string>& split_header, const std::vector<uint8_t>& body);
+    void send_http_message(BIO* bio, const std::multimap<std::string, std::string>& split_header, const std::vector<uint8_t>& body);
     void read_chunked(BIO* bio, std::vector<uint8_t>& body);
-    std::vector<uint8_t> receive_http_message(BIO* bio, std::map<std::string, std::string>& split_header);
+    std::vector<uint8_t> receive_http_message(BIO* bio, std::multimap<std::string, std::string>& split_header);
     SSL* get_ssl(BIO* bio);
     void verify_the_certificate(SSL* ssl);
     void set_timeout(BIO* bio);
@@ -37,17 +37,20 @@ protected:
     void replace_all_target_to_server_and_filter(
         std::vector<uint8_t>& buffer,
         const std::string& host_name,
-        const std::map<std::string, std::string>& request_header);
+        const std::multimap<std::string, std::string>& request_header);
     void replace_all_target_to_server(std::string& buffer, const std::string& host_name);
-    void uncompress(std::vector<uint8_t>& buffer, std::map<std::string, std::string>& header);
+    void uncompress(std::vector<uint8_t>& buffer, std::multimap<std::string, std::string>& header);
     std::vector<uint8_t> unzip(const std::vector<uint8_t>& buffer, bool& success);
     std::vector<uint8_t> ungzip(const std::vector<uint8_t>& buffer, bool& success);
+    std::vector<uint8_t> unbrotli(const std::vector<uint8_t>& buffer, bool& success);
 
     bool is_text(const std::string& content_type);
 
+    void check_and_dump_errors(const std::multimap<std::string, std::string>& request_header, const std::multimap<std::string, std::string>& response_header);
+
     int run_single_port(const std::string& host_name, const std::string& server_port);
 
-    virtual void filter(std::string& buffer, const std::map<std::string, std::string>& request_header);
+    virtual void filter(std::string& buffer, const std::multimap<std::string, std::string>& request_header);
 
     void adopt_site(const std::string& target);
     void adopt_all_domain_names(const std::string& buffer);

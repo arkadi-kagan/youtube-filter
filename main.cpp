@@ -20,6 +20,7 @@ static int print_help(const char* app_name, const char* hostname)
         << "    openssl req -new -x509 -sha256 -key server-private-key.pem -subj \"/CN=" << hostname << "\" -out server-certificate.pem\n"
         << "    sudo cp ./server-certificate.pem /usr/local/share/ca-certificates/server-certificate.crt\n";
     std::cout << std::endl;
+    // TODO (maybe): Update instructions by https://linuxconfig.org/step-by-step-guide-adding-certificates-to-ubuntus-trusted-authorities
     return 1;
 }
 

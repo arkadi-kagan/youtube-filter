@@ -3,9 +3,11 @@
 #include <sys/socket.h>
 #include <zip.h>
 #include <zlib.h>
+#include <brotli/decode.h>
 
 
 static const std::string HTTPS_PORT = "443";
+static const std::string START_HEADER_MARKER = "---START---";
 
 // Proxy for a single proxy/target pair
 std::string ProxyHTTPS::trim(const std::string str)
@@ -72,16 +74,16 @@ std::vector<std::string> ProxyHTTPS::split_headers(const std::string& text)
     return lines;
 }
 
-void ProxyHTTPS::send_http_message(BIO* bio, const std::map<std::string, std::string>& split_header, const std::vector<uint8_t>& body)
+void ProxyHTTPS::send_http_message(BIO* bio, const std::multimap<std::string, std::string>& split_header, const std::vector<uint8_t>& body)
 {
     std::string enter = "\r\n";
     std::string header_separator = ": ";
     std::vector<uint8_t> buffer;
-    if (split_header.count("---START---") == 0)
+    if (split_header.count(START_HEADER_MARKER) == 0)
         return;
     for (const auto& pair : split_header)
     {
-        if (pair.first == "---START---")
+        if (pair.first == START_HEADER_MARKER)
         {
             buffer.insert(buffer.begin(), pair.second.begin(), pair.second.end());
         }
@@ -216,7 +218,7 @@ void ProxyHTTPS::read_chunked(BIO* bio, std::vector<uint8_t>& body)
     }
 }
 
-std::vector<uint8_t> ProxyHTTPS::receive_http_message(BIO* bio, std::map<std::string, std::string>& split_header)
+std::vector<uint8_t> ProxyHTTPS::receive_http_message(BIO* bio, std::multimap<std::string, std::string>& split_header)
 {
     split_header.clear();
     std::vector<uint8_t> headers        = receive_some_data(bio);
@@ -237,20 +239,21 @@ std::vector<uint8_t> ProxyHTTPS::receive_http_message(BIO* bio, std::map<std::st
         size_t colon_pos = line.find_first_of(':');
         if (split_header.empty())
         {
-            split_header["---START---"] = trim(line);
+            split_header.erase(START_HEADER_MARKER);
+            split_header.insert({START_HEADER_MARKER, trim(line)});
         }
         else if (colon_pos != std::string::npos)
         {
             std::string header_name   = trim(line.substr(0, colon_pos));
             std::string value         = trim(line.substr(colon_pos + 1));
-            split_header[header_name] = value;
+            split_header.insert({header_name, value});
             if (header_name == "Content-Length")
             {
                 content_length = std::stoul(value.c_str());
             }
         }
     }
-    if (split_header.count("---START---") == 0)
+    if (split_header.count(START_HEADER_MARKER) == 0)
         return body;
     if (split_header.count("Content-Length") > 0)
     {
@@ -260,11 +263,12 @@ std::vector<uint8_t> ProxyHTTPS::receive_http_message(BIO* bio, std::map<std::st
             body.insert(body.end(), tmp.begin(), tmp.end());
         }
     }
-    else if (split_header["---START---"].substr(0, 4) == "HTTP" && split_header.count("Transfer-Encoding") > 0 && split_header["Transfer-Encoding"] == "chunked")
+    else if (split_header.find(START_HEADER_MARKER)->second.substr(0, 4) == "HTTP" && split_header.count("Transfer-Encoding") > 0 && split_header.find("Transfer-Encoding")->second == "chunked")
     {
         read_chunked(bio, body);
         split_header.erase("Transfer-Encoding");
-        split_header["Content-Length"] = std::to_string(body.size());
+        split_header.erase("Content-Length");
+        split_header.insert({"Content-Length", std::to_string(body.size())});
     }
     return body;
 }
@@ -327,6 +331,11 @@ void ProxyHTTPS::replace_domain_name(std::string& buffer, const std::string& fro
         }
         if (pos == std::string::npos)
             break;
+        if (isalnum(buffer[pos + from.length()]))
+        {
+            pos += from.length();
+            continue;
+        }
         buffer =
             buffer.substr(0, pos) +
             to +
@@ -355,7 +364,7 @@ void ProxyHTTPS::replace_all_server_to_target(std::string& buffer, const std::st
 void ProxyHTTPS::replace_all_target_to_server_and_filter(
     std::vector<uint8_t>& buffer,
     const std::string& host_name,
-    const std::map<std::string, std::string>& request_header)
+    const std::multimap<std::string, std::string>& request_header)
 {
     std::string buffer_str((char*)buffer.data(), buffer.size());
     adopt_all_domain_names(buffer_str);
@@ -373,34 +382,45 @@ void ProxyHTTPS::replace_all_target_to_server(std::string& buffer, const std::st
     }
 }
 
-void ProxyHTTPS::uncompress(std::vector<uint8_t>& buffer, std::map<std::string, std::string>& header)
+void ProxyHTTPS::uncompress(std::vector<uint8_t>& buffer, std::multimap<std::string, std::string>& header)
 {
-    if (header.count("Content-Type") > 0 && !is_text(header["Content-Type"]))
+    if (header.count("Content-Type") > 0 && !is_text(header.find("Content-Type")->second))
         return;
     if (header.count("Content-Encoding") == 0)
         return;
     bool success;
-    if (header["Content-Encoding"] == "zip")
+    if (header.find("Content-Encoding")->second == "zip")
     {
         buffer = unzip(buffer, success);
         if (success)
-            header["Content-Encoding"] = "identity";
+        {
+            header.erase("Content-Encoding");
+            header.insert({"Content-Encoding", "identity"});
+        }
     }
 
-    if (header["Content-Encoding"] == "gzip")
+    if (header.find("Content-Encoding")->second == "gzip")
     {
-        //////////////////////////////////////
-        /// Debug
-        FILE* f = fopen("t.gz", "w");
-        fwrite(buffer.data(), 1, buffer.size(), f);
-        fclose(f);
-        //////////////////////////////////////
-
-
         buffer = ungzip(buffer, success);
         if (success)
-            header["Content-Encoding"] = "identity";
+        {
+            header.erase("Content-Encoding");
+            header.insert({"Content-Encoding", "identity"});
+        }
     }
+
+    if (header.find("Content-Encoding")->second == "br")
+    {
+        buffer = unbrotli(buffer, success);
+        if (success)
+        {
+            header.erase("Content-Encoding");
+            header.insert({"Content-Encoding", "identity"});
+        }
+    }
+
+    if (header.find("Content-Encoding")->second != "identity")
+        std::cerr << "Warning: Content-Encoding is " << header.find("Content-Encoding")->second << std::endl;
 }
 
 std::vector<uint8_t> ProxyHTTPS::unzip(const std::vector<uint8_t>& buffer, bool& success)
@@ -472,12 +492,48 @@ std::vector<uint8_t> ProxyHTTPS::ungzip(const std::vector<uint8_t>& buffer, bool
     return result;
 }
 
+std::vector<uint8_t> ProxyHTTPS::unbrotli(const std::vector<uint8_t>& buffer, bool& success)
+{
+    success = false;
+    constexpr const int CHUNK = 0xFFFFFF;
+    std::vector<uint8_t> out(CHUNK);
+    BrotliDecoderState* state = BrotliDecoderCreateInstance(nullptr, nullptr, nullptr);
+    BrotliDecoderResult result = BROTLI_DECODER_RESULT_ERROR;
+
+    size_t available_in = buffer.size();
+    const std::uint8_t* next_in = buffer.data();
+    size_t available_out = out.size();
+    std::uint8_t* next_out = out.data();
+
+    size_t total_out = 0;
+    result = BrotliDecoderDecompressStream(state, &available_in, &next_in, &available_out, &next_out, &total_out);
+    if (result == BROTLI_DECODER_RESULT_SUCCESS)
+    {
+        out.resize(total_out);
+        success = true;
+    }
+    else
+    {
+        out = buffer;
+        success = false;
+    }
+
+    BrotliDecoderDestroyInstance(state);
+    return out;
+}
+
 bool ProxyHTTPS::is_text(const std::string& content_type)
 {
-    if (content_type.find("text/html") != std::string::npos)
-        return true;
-    if (content_type.find("text/javascript") != std::string::npos)
-        return true;
+    std::vector<std::string> tokens = {
+        "text/html",
+        "text/css",
+        "text/javascript",
+    };
+    for (const auto& token : tokens)
+    {
+        if (content_type.find(token) != std::string::npos)
+            return true;
+    }
     return false;
 }
 
@@ -570,7 +626,7 @@ std::string ProxyHTTPS::wget_text(const std::string& target, const std::string& 
         send_http_message(
             ssl_bio_client,
             {
-                {"---START---", "GET " + path + " HTTP/1.1"},
+                {START_HEADER_MARKER, "GET " + path + " HTTP/1.1"},
                 {"Host", target},
                 {"Accept-Encoding", "identity"},
                 {"Cache-Control", "no-cache"},
@@ -580,7 +636,7 @@ std::string ProxyHTTPS::wget_text(const std::string& target, const std::string& 
             },
             {});
 
-        std::map<std::string, std::string> response_header;
+        std::multimap<std::string, std::string> response_header;
         std::vector<uint8_t> response_body = receive_http_message(ssl_bio_client, response_header);
         result = std::string((char*)response_body.data(), response_body.size());
 
@@ -593,6 +649,27 @@ std::string ProxyHTTPS::wget_text(const std::string& target, const std::string& 
         std::cerr << "Failed to read \"" << url << "\":\n" << ex.what() << std::endl;
     }
     return result;
+}
+
+void ProxyHTTPS::check_and_dump_errors(const std::multimap<std::string, std::string>& request_header, const std::multimap<std::string, std::string>& response_header)
+{
+    if (
+        response_header.count(START_HEADER_MARKER) == 0 ||
+        (
+            response_header.find(START_HEADER_MARKER)->second.find(" 200 OK") == std::string::npos &&
+            response_header.find(START_HEADER_MARKER)->second.find(" 204 No Content") == std::string::npos
+        ))
+    {
+        std::cout << "Something went wrong\n";
+        std::cout
+            << "-------------------------------------\n"
+            << "Request:\n"
+            << "-------------------------------------\n";
+        for (const auto& pair : request_header)
+            std::cout << pair.first << ": " << pair.second << "\n";
+        std::cout
+            << "-------------------------------------" << std::endl;
+    }
 }
 
 int ProxyHTTPS::run_single_port(const std::string& host_name, const std::string& server_port)
@@ -649,24 +726,29 @@ int ProxyHTTPS::run_single_port(const std::string& host_name, const std::string&
         {
             set_timeout(bio);
 
-            std::map<std::string, std::string> request_header;
+            std::multimap<std::string, std::string> request_header;
             std::vector<uint8_t> request_body = receive_http_message(bio, request_header);
-            if (request_header.count("---START---") == 0)
+            if (request_header.count(START_HEADER_MARKER) == 0)
             {
                 BIO_free_all(bio);
                 continue;
             }
-            if (is_text(request_header["Accept"]))
-                request_header["Accept-Encoding"] = "identity";
+            if (request_header.count("Accept") > 0 && is_text(request_header.find("Accept")->second))
+            {
+                request_header.erase("Accept-Encoding");
+                request_header.insert({"Accept-Encoding", "identity"});
+            }
 
             for (auto& request_pair : request_header)
             {
                 replace_all_server_to_target(request_pair.second, host_name);
                 adopt_all_domain_names(request_pair.second);
+                if (request_pair.first == "Set-Cookie")
+                    replace_all(request_pair.second, "Domain=" + host_name, "Domain=.youtube.com");
             }
             replace_all_server_to_target(request_body, host_name);
             
-            std::cout << "Request from " << server_port << ": " << request_header["---START---"] << std::endl;
+            std::cout << "Request from " << server_port << ": " << request_header.find(START_HEADER_MARKER)->second << std::endl;
 
             std::string connection_string = target + ":" + HTTPS_PORT;
             BIO*        client_bio        = BIO_new_connect(connection_string.c_str());
@@ -694,26 +776,35 @@ int ProxyHTTPS::run_single_port(const std::string& host_name, const std::string&
 
             send_http_message(ssl_bio_client, request_header, request_body);
 
-            std::map<std::string, std::string> response_header;
+            std::multimap<std::string, std::string> response_header;
             std::vector<uint8_t> response_body = receive_http_message(ssl_bio_client, response_header);
+
+            check_and_dump_errors(request_header, response_header);
 
             uncompress(response_body, response_header);
 
-            if (is_text(response_header["Content-Type"]))
+            if (response_header.count("Content-Type") > 0 && is_text(response_header.find("Content-Type")->second))
                 replace_all_target_to_server_and_filter(response_body, host_name, request_header);
 
             if (response_header.count("Content-Length") > 0)
-                response_header["Content-Length"] = std::to_string(response_body.size());
+            {
+                response_header.erase("Content-Length");
+                response_header.insert({"Content-Length", std::to_string(response_body.size())});
+            }
             
-            response_header["Access-Control-Allow-Origin"] = "*";
+            response_header.erase("Access-Control-Allow-Origin");
+            response_header.insert({"Access-Control-Allow-Origin", "*"});
 
             for (auto& response_pair : response_header)
             {
                 adopt_all_domain_names(response_pair.second);
+                if (response_pair.first == "Set-Cookie")
+                    replace_all(response_pair.second, "Domain=.youtube.com", "Domain=" + host_name);
                 replace_all_target_to_server(response_pair.second, host_name);
             }
 
-            std::cout << "Response to " << server_port << ": " << response_header["---START---"] << std::endl;
+            if (response_header.count(START_HEADER_MARKER) > 0)
+                std::cout << "Response to " << server_port << ": " << response_header.find(START_HEADER_MARKER)->second << std::endl;
 
             send_http_message(bio, response_header, response_body);
 
@@ -768,28 +859,28 @@ void ProxyHTTPS::adopt_site(const std::string& target)
     }));
 }
 
-void ProxyHTTPS::filter(std::string& buffer, const std::map<std::string, std::string>& request_header)
+void ProxyHTTPS::filter(std::string& buffer, const std::multimap<std::string, std::string>& request_header)
 {
-    // This filter will be filled with debug code.
-    // Real filter must be implemented in ProxyHTTPS heir.
-    std::vector<std::string> tokens = {
-        "action_handle_signin",
-    };
-    for (const auto& token : tokens)
-    {
-        auto pos = buffer.find(token);
-        if (pos != std::string::npos)
-        {
-            std::cout << "Found " << token << std::endl;
-            if (pos > 40)
-                std::cout << "\t" << buffer.substr(pos - 40, 70) << std::endl;
-            else
-                std::cout << "\t" << buffer.substr(0, 20) << std::endl;
-            std::cout << "request_header:\n";
-            for (const auto& pair : request_header)
-            {
-                std::cout << pair.first << ": " << pair.second << std::endl;
-            }
-        }
-    }
+    // // This filter will be filled with debug code.
+    // // Real filter must be implemented in ProxyHTTPS heir.
+    // std::vector<std::string> tokens = {
+    //     "action_handle_signin",
+    // };
+    // for (const auto& token : tokens)
+    // {
+    //     auto pos = buffer.find(token);
+    //     if (pos != std::string::npos)
+    //     {
+    //         std::cout << "Found " << token << std::endl;
+    //         if (pos > 40)
+    //             std::cout << "\t" << buffer.substr(pos - 40, 70) << std::endl;
+    //         else
+    //             std::cout << "\t" << buffer.substr(0, 20) << std::endl;
+    //         std::cout << "request_header:\n";
+    //         for (const auto& pair : request_header)
+    //         {
+    //             std::cout << pair.first << ": " << pair.second << std::endl;
+    //         }
+    //     }
+    // }
 }
